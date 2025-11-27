@@ -2,8 +2,7 @@
 
 AppHack es un HUB modular de herramientas orientadas a auditoría y pruebas de seguridad. Actualmente la única herramienta implementada es un escáner de IP/puertos, pero la arquitectura está preparada para añadir más utilidades (fuzzers, enumeradores, exploits, etc.).
 
-![DEMO](app\UI\img\demostracion.gif)
-
+<img src="app\UI\img\demostracion.gif" alt="demo">
 ---
 
 ## ⚠️ Aviso Legal
