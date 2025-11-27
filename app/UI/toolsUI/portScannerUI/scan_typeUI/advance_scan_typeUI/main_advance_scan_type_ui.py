@@ -757,7 +757,6 @@ class AdvanceScanTypeUI(QWidget):
         if hasattr(self, 'scan_thread') and self.scan_thread and self.scan_thread.isRunning():
             self.append_log("Ya hay un escaneo en progreso.")
             return
-        self.log_text.clear()
         params = self._collect_params()
         self.append_log("Iniciando escaneo en segundo plano...")
         self.scan_thread = QThread()
@@ -795,14 +794,28 @@ class AdvanceScanTypeUI(QWidget):
 
     def _handle_worker_error(self, msg):
         self.append_log(f"Error: {msg}")
-        if self.scan_thread:
-            self.scan_thread.quit()
+        # Ensure thread is fully shut down and cleaned so a new scan can start
+        try:
+            if hasattr(self, 'scan_thread') and self.scan_thread:
+                self.scan_thread.quit()
+                self.scan_thread.wait()
+        finally:
+            # Clear references to allow subsequent scans
+            self.scan_thread = None
+            self.worker = None
 
     def _handle_worker_finished(self, result):
-        self.append_log("Escaneo finalizado.")
-        self.append_log(str(result))
-        if self.scan_thread:
-            self.scan_thread.quit()
+        # No mostrar ningún resumen final al terminar el análisis.
+        # El worker ya ha enviado mensajes durante el escaneo; aquí solo cerramos el hilo.
+        try:
+            if hasattr(self, 'scan_thread') and self.scan_thread:
+                self.scan_thread.quit()
+                # Wait for the thread to actually exit before allowing a new one
+                self.scan_thread.wait()
+        finally:
+            # Release references so next scan can start cleanly
+            self.scan_thread = None
+            self.worker = None
 
     def append_log(self, message):
         self.log_text.append(message)
