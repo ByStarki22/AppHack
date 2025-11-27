@@ -1,9 +1,9 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QRadioButton, QComboBox,
     QPushButton, QCheckBox, QGroupBox, QButtonGroup, QLineEdit, QFrame, QSizePolicy, QSpacerItem, QTextEdit,
-    QScrollArea
+    QScrollArea, QStyle
 )
-from PySide6.QtCore import Qt, QThread, Signal, QEvent, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QEvent, QTimer, QObject
 from app.UI.toolsUI.portScannerUI.scan_typeUI.advance_scan_typeUI.advance_widgets_ui.advance_firewall_evasion_spoofing_ui import FirewallEvasionOptionsUI
 from app.UI.toolsUI.portScannerUI.scan_typeUI.advance_scan_typeUI.advance_widgets_ui.advance_host_discovery_ui import HostDiscoveryOptionsUI
 from app.UI.toolsUI.portScannerUI.scan_typeUI.advance_scan_typeUI.advance_widgets_ui.advance_miscellaneous_ui import MiscellaneousOptionsUI
@@ -15,6 +15,354 @@ from app.UI.toolsUI.portScannerUI.scan_typeUI.advance_scan_typeUI.advance_widget
 from app.UI.toolsUI.portScannerUI.scan_typeUI.advance_scan_typeUI.advance_widgets_ui.advance_timing_switches_ui import TimingPerformanceSwitchesUI
 from app.UI.toolsUI.portScannerUI.scan_typeUI.advance_scan_typeUI.advance_widgets_ui.advanced_type_scan_ui import ScanTechniquesUI
 import logging
+import asyncio
+import socket
+import time
+
+from app.logic.toolsLogic.portSscanner.scan_type.advance_scan_type.advance_widgets import advance_target_specification as adv_scan_logic
+
+class ScanWorker(QObject):
+    progress = Signal(str)
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, params):
+        super().__init__()
+        self.params = params
+        self._stop = False
+        self._paused = False
+
+    def stop(self):
+        self._stop = True
+        self._paused = False
+
+    def pause(self):
+        if not self._stop:
+            self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    def _pause_check(self):
+        while self._paused and not self._stop:
+            QThread.msleep(100)
+
+    def _run_async(self, coro):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(coro)
+            return result
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+    def run(self):
+        try:
+            result = self._do_scan()
+            if not self._stop:
+                self.finished.emit(result)
+            else:
+                self.finished.emit({"status": "cancelled"})
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _do_scan(self):
+        p = self.params
+        # Determinar tipo de escaneo según flags
+        exclude_list = self._build_exclude_list(p)
+        # Orden de prioridad similar al UI original
+        if p['single_ip']:
+            ip = p['single_ip_value']
+            if not ip:
+                self.progress.emit("Debes ingresar una IP válida.")
+                return {}
+            self.progress.emit(f"Escaneando IP única: {ip}")
+            return {ip: self._scan_common_ports_interruptible(ip, exclude_list=exclude_list)}
+
+        if p['multiple_ips']:
+            raw = p['multiple_ips_value']
+            ip_list = [ip.strip() for ip in raw.replace(',', ' ').split() if ip.strip()]
+            self.progress.emit(f"Escaneando múltiples IPs: {', '.join(ip_list)}")
+            results = {}
+            for ip in ip_list:
+                if self._stop:
+                    break
+                self._pause_check()
+                self.progress.emit(f"→ IP {ip}")
+                results[ip] = self._scan_common_ports_interruptible(ip, exclude_list=exclude_list)
+            return results
+
+        if p['ip_ranges']:
+            ranges_str = p['ip_ranges_value']
+            self.progress.emit(f"Escaneando rangos: {ranges_str}")
+            # Re-implementa para permitir pausa/cancel
+            ranges = [r.strip() for r in ranges_str.split(',') if r.strip()]
+            ip_list = []
+            for r in ranges:
+                if '-' not in r:
+                    continue
+                base, end = r.split('-')
+                base_parts = base.strip().split('.')
+                if len(base_parts) != 4:
+                    continue
+                try:
+                    start = int(base_parts[3])
+                    end_oct = int(end.strip())
+                    if not (0 <= start <= 255 and 0 <= end_oct <= 255 and start <= end_oct):
+                        continue
+                    for last_octet in range(start, end_oct + 1):
+                        ip = '.'.join(base_parts[:3] + [str(last_octet)])
+                        ip_list.append(ip)
+                except Exception:
+                    continue
+            # Excluir
+            if exclude_list:
+                ip_list = [i for i in ip_list if i not in exclude_list]
+            results = {}
+            for ip in ip_list:
+                if self._stop:
+                    break
+                self._pause_check()
+                self.progress.emit(f"→ IP {ip}")
+                results[ip] = self._scan_common_ports_interruptible(ip, exclude_list=exclude_list)
+            return results
+
+        if p['cidr']:
+            cidr_str = p['cidr_value']
+            self.progress.emit(f"Escaneando CIDR: {cidr_str}")
+            # Implementación manual para pausa/cancel
+            results = {}
+            try:
+                ip_part, prefix = cidr_str.split('/')
+                prefix = int(prefix)
+                if not (24 <= prefix <= 32):
+                    self.progress.emit("El prefijo debe estar entre /24 y /32.")
+                    return results
+                def ip_to_int(ip):
+                    return sum(int(part) << (8 * (3 - i)) for i, part in enumerate(ip.split('.')))
+                def int_to_ip(num):
+                    return '.'.join(str((num >> (8 * (3 - i))) & 0xFF) for i in range(4))
+                start_ip_int = ip_to_int(ip_part.strip())
+                num_hosts = 2 ** (32 - prefix)
+                end_ip_int = start_ip_int + num_hosts - 1
+                ip_list = [int_to_ip(ip_int) for ip_int in range(start_ip_int, end_ip_int + 1)]
+                if exclude_list:
+                    ip_list = [i for i in ip_list if i not in exclude_list]
+                for ip in ip_list:
+                    if self._stop:
+                        break
+                    self._pause_check()
+                    self.progress.emit(f"→ IP {ip}")
+                    results[ip] = self._scan_common_ports_interruptible(ip, exclude_list=exclude_list)
+            except Exception as e:
+                self.progress.emit(f"Error CIDR: {e}")
+            return results
+
+        if p['domain']:
+            domain = p['domain_value']
+            if not domain:
+                self.progress.emit("Debes ingresar un dominio válido.")
+                return {}
+            self.progress.emit(f"Escaneando dominio (interruptible): {domain}")
+            ports = self._scan_domain_interruptible(domain, exclude_list=exclude_list)
+            return {domain: ports}
+
+        if p['from_file']:
+            path = p['from_file_value']
+            if not path:
+                self.progress.emit("Debes seleccionar un archivo válido.")
+                return {}
+            self.progress.emit(f"Escaneando objetivos desde archivo: {path}")
+            results = {}
+            try:
+                with open(path, 'r') as f:
+                    lines = [line.strip() for line in f if line.strip()]
+                for target in lines:
+                    if self._stop:
+                        break
+                    self._pause_check()
+                    self.progress.emit(f"→ Objetivo {target}")
+                    if '/' in target:
+                        # CIDR
+                        sub_params = dict(p)
+                        sub_params.update({'cidr': True, 'cidr_value': target})
+                        # Reutiliza parte CIDR llamando recursivamente (simple)
+                        # Para evitar duplicar lógica puedes llamar a scan_cidr directamente (sin pausa interna)
+                        # Procesar CIDR de forma interruptible
+                        cidr_results = {}
+                        try:
+                            ip_part, prefix = target.split('/')
+                            prefix = int(prefix)
+                            if not (24 <= prefix <= 32):
+                                self.progress.emit(f"Prefijo inválido en {target}")
+                            else:
+                                def ip_to_int(ip):
+                                    return sum(int(part) << (8 * (3 - i)) for i, part in enumerate(ip.split('.')))
+                                def int_to_ip(num):
+                                    return '.'.join(str((num >> (8 * (3 - i))) & 0xFF) for i in range(4))
+                                start_ip_int = ip_to_int(ip_part.strip())
+                                num_hosts = 2 ** (32 - prefix)
+                                end_ip_int = start_ip_int + num_hosts - 1
+                                ip_list = [int_to_ip(ip_int) for ip_int in range(start_ip_int, end_ip_int + 1)]
+                                if exclude_list:
+                                    ip_list = [i for i in ip_list if i not in exclude_list]
+                                for ip_cidr in ip_list:
+                                    if self._stop:
+                                        break
+                                    self._pause_check()
+                                    cidr_results[ip_cidr] = self._scan_common_ports_interruptible(ip_cidr, exclude_list=exclude_list)
+                        except Exception as e:
+                            self.progress.emit(f"Error CIDR {target}: {e}")
+                        results[target] = cidr_results
+                    elif '-' in target:
+                        range_results = {}
+                        try:
+                            base, end_octet = target.split('-')
+                            base_parts = base.strip().split('.')
+                            start_oct = int(base_parts[3])
+                            end_oct = int(end_octet.strip())
+                            for last_octet in range(start_oct, end_oct + 1):
+                                ip_rng = '.'.join(base_parts[:3] + [str(last_octet)])
+                                if exclude_list and ip_rng in exclude_list:
+                                    continue
+                                if self._stop:
+                                    break
+                                self._pause_check()
+                                range_results[ip_rng] = self._scan_common_ports_interruptible(ip_rng, exclude_list=exclude_list)
+                        except Exception as e:
+                            self.progress.emit(f"Error rango {target}: {e}")
+                        results[target] = range_results
+                    elif all(c.isdigit() or c == '.' for c in target):
+                        if exclude_list and target in exclude_list:
+                            continue
+                        results[target] = self._scan_common_ports_interruptible(target, exclude_list=exclude_list)
+                    else:
+                        results[target] = self._scan_domain_interruptible(target, exclude_list=exclude_list)
+            except Exception as e:
+                self.progress.emit(f"Error archivo: {e}")
+            return results
+
+        if p['random']:
+            count = p['random_value'] or 10
+            try:
+                count_int = int(count)
+            except ValueError:
+                self.progress.emit("Cantidad aleatoria inválida, usando 10.")
+                count_int = 10
+            self.progress.emit(f"Escaneando {count_int} IPs aleatorias")
+            results = {}
+            scanned = set()
+            generated = 0
+            while generated < count_int and not self._stop:
+                self._pause_check()
+                ip = adv_scan_logic.generate_random_ip()
+                if ip in scanned or (exclude_list and ip in exclude_list):
+                    continue
+                scanned.add(ip)
+                self.progress.emit(f"→ IP aleatoria {ip}")
+                results[ip] = self._scan_common_ports_interruptible(ip, exclude_list=exclude_list)
+                generated += 1
+            return results
+
+        self.progress.emit("Debes seleccionar al menos una opción de objetivo.")
+        return {}
+
+    def _build_exclude_list(self, p):
+        exclude_list = []
+        # Manual exclude
+        if p['exclude'] and p['exclude_value']:
+            exclude_list += [ip.strip() for ip in p['exclude_value'].replace(',', ' ').split() if ip.strip()]
+        # From file
+        if p['excludefile'] and p['excludefile_value']:
+            try:
+                with open(p['excludefile_value'], 'r') as f:
+                    exclude_list += [line.strip() for line in f if line.strip()]
+            except Exception:
+                self.progress.emit("No se pudo leer archivo de exclusión.")
+        return exclude_list
+
+    def _scan_common_ports_interruptible(self, ip, exclude_list=None):
+        if exclude_list and ip in exclude_list:
+            self.progress.emit(f"IP {ip} excluida.")
+            return []
+        try:
+            resolved_ip = socket.gethostbyname(ip)
+        except Exception:
+            self.progress.emit(f"No se pudo resolver {ip}")
+            return []
+        port_states = []
+        start_time = time.time()
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        futures = {}
+        max_workers = 150
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for port, proto in adv_scan_logic.COMMON_PORTS:
+                if self._stop:
+                    break
+                futures[executor.submit(adv_scan_logic.scan_tcp_port, resolved_ip, port)] = (port, proto)
+            for future in as_completed(futures):
+                if self._stop:
+                    break
+                self._pause_check()
+                port, proto = futures[future]
+                try:
+                    port_num, state = future.result()
+                except Exception:
+                    port_num, state = port, 'filtered'
+                service = adv_scan_logic.get_service_name(port_num, proto.lower())
+                port_states.append((port, proto, service, state))
+                if state == 'open':
+                    self.progress.emit(f"{ip} {port}/{proto} ({service}): open")
+        elapsed = time.time() - start_time
+        if self._stop:
+            self.progress.emit(f"Cancelado {ip} en {elapsed:.2f}s")
+        else:
+            self.progress.emit(f"Completado {ip} en {elapsed:.2f}s")
+        return port_states
+
+    def _scan_domain_interruptible(self, domain, exclude_list=None):
+        try:
+            ip = socket.gethostbyname(domain)
+        except Exception:
+            self.progress.emit(f"No se pudo resolver dominio {domain}")
+            return []
+        if exclude_list and (domain in exclude_list or ip in exclude_list):
+            self.progress.emit(f"Dominio {domain} excluido")
+            return []
+        start_time = time.time()
+        port_states = []
+        for port, proto in adv_scan_logic.COMMON_PORTS:
+            if self._stop:
+                break
+            self._pause_check()
+            state = self._scan_single_tcp_port(ip, port)
+            service = adv_scan_logic.get_service_name(port, proto.lower())
+            port_states.append((port, proto, service, state))
+            if state == 'open':
+                self.progress.emit(f"{domain} {port}/{proto} ({service}): open")
+        elapsed = time.time() - start_time
+        if self._stop:
+            self.progress.emit(f"Dominio {domain} cancelado en {elapsed:.2f}s")
+        else:
+            self.progress.emit(f"Dominio {domain} completado en {elapsed:.2f}s")
+        return port_states
+
+    def _scan_single_tcp_port(self, ip, port, timeout=0.3):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                result = s.connect_ex((ip, port))
+                if result == 0:
+                    return 'open'
+                elif result in (111, 10061):
+                    return 'closed'
+                else:
+                    return 'filtered'
+        except Exception:
+            return 'filtered'
 
 class ScanThread(QThread):
     result_ready = Signal(dict)
@@ -32,14 +380,17 @@ class ScanThread(QThread):
             self.error.emit(str(e))
 
 
-class QTextEditLogger(logging.Handler):
+class QTextEditLogger(logging.Handler, QObject):
+    log_signal = Signal(str)
     def __init__(self, text_edit: QTextEdit):
-        super().__init__()
+        logging.Handler.__init__(self)
+        QObject.__init__(self)
         self.text_edit = text_edit
+        self.log_signal.connect(self.text_edit.append)
 
     def emit(self, record):
         msg = self.format(record)
-        self.text_edit.append(msg)
+        self.log_signal.emit(msg)
 
 
 class AdvanceScanTypeUI(QWidget):
@@ -286,6 +637,28 @@ class AdvanceScanTypeUI(QWidget):
             }
         """)
         btn_layout.addWidget(self.btn_cancel)
+        # Conectar botón cancelar directamente
+        self.btn_cancel.clicked.connect(self._cancel_scan)
+
+        # Nuevo botón limpiar consola (papelera)
+        self.btn_clear_console = QPushButton()
+        self.btn_clear_console.setCursor(Qt.PointingHandCursor)
+        self.btn_clear_console.setFixedSize(60, 60)
+        self.btn_clear_console.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
+        self.btn_clear_console.setStyleSheet("""
+            QPushButton {
+                background-color: #444;
+                color: white;
+                border-radius: 8px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #666;
+            }
+        """)
+        self.btn_clear_console.setToolTip("Limpiar consola")
+        self.btn_clear_console.clicked.connect(self.clear_console)
+        btn_layout.addWidget(self.btn_clear_console)
 
         btn_layout.addStretch()
         main_layout.addLayout(btn_layout)
@@ -380,9 +753,56 @@ class AdvanceScanTypeUI(QWidget):
         self.setLayout(outer_layout)
 
     def on_start_scan_clicked(self):
-        # Llama al método de escaneo del target_selector y muestra los mensajes en el log
+        # Si ya hay un hilo corriendo, evitar nuevo
+        if hasattr(self, 'scan_thread') and self.scan_thread and self.scan_thread.isRunning():
+            self.append_log("Ya hay un escaneo en progreso.")
+            return
         self.log_text.clear()
-        self.target_selector.on_scan_button_clicked()
+        params = self._collect_params()
+        self.append_log("Iniciando escaneo en segundo plano...")
+        self.scan_thread = QThread()
+        self.worker = ScanWorker(params)
+        self.worker.moveToThread(self.scan_thread)
+        self.scan_thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self.append_log)
+        self.worker.error.connect(self._handle_worker_error)
+        self.worker.finished.connect(self._handle_worker_finished)
+        self.scan_thread.finished.connect(self.scan_thread.deleteLater)
+        self.scan_thread.start()
+
+    def _collect_params(self):
+        t = self.target_selector
+        return {
+            'single_ip': t.checkbox_single_ip.isChecked(),
+            'single_ip_value': t.input_single_ip.text().strip(),
+            'multiple_ips': t.checkbox_multiple_ips.isChecked(),
+            'multiple_ips_value': t.input_multiple_ips.text().strip(),
+            'ip_ranges': t.checkbox_ip_range.isChecked(),
+            'ip_ranges_value': t.input_ip_ranges.text().strip(),
+            'cidr': t.checkbox_cidr.isChecked(),
+            'cidr_value': t.input_cidr.text().strip(),
+            'domain': t.checkbox_domain.isChecked(),
+            'domain_value': t.input_domain.text().strip(),
+            'from_file': t.checkbox_from_file.isChecked(),
+            'from_file_value': t.input_from_file.text().strip(),
+            'random': t.checkbox_random.isChecked(),
+            'random_value': t.input_random.text().strip(),
+            'exclude': t.checkbox_exclude.isChecked(),
+            'exclude_value': t.input_exclude.text().strip(),
+            'excludefile': t.checkbox_excludefile.isChecked(),
+            'excludefile_value': t.input_excludefile.text().strip(),
+        }
+
+    def _handle_worker_error(self, msg):
+        self.append_log(f"Error: {msg}")
+        if self.scan_thread:
+            self.scan_thread.quit()
+
+    def _handle_worker_finished(self, result):
+        self.append_log("Escaneo finalizado.")
+        self.append_log(str(result))
+        if self.scan_thread:
+            self.scan_thread.quit()
 
     def append_log(self, message):
         self.log_text.append(message)
@@ -399,7 +819,47 @@ class AdvanceScanTypeUI(QWidget):
 
     def toggle_pause_icon(self):
         current_text = self.btn_toggle_pause.text()
+        if not hasattr(self, 'worker'):
+            return
         if current_text == "▮▮":
-            self.btn_toggle_pause.setText("▶")  # Cambia a Reanudar
+            self.btn_toggle_pause.setText("▶")
+            self.append_log("Pausa solicitada.")
+            self.worker.pause()
         else:
-            self.btn_toggle_pause.setText("▮▮")  # Cambia a Pausa
+            self.btn_toggle_pause.setText("▮▮")
+            self.append_log("Reanudando.")
+            self.worker.resume()
+
+    def clear_console(self):
+        self.log_text.clear()
+
+    def _setup_cancel(self):
+        if hasattr(self, 'btn_cancel'):
+            try:
+                self.btn_cancel.clicked.disconnect()
+            except Exception:
+                pass
+            self.btn_cancel.clicked.connect(self._cancel_scan)
+
+    def _cancel_scan(self):
+        if hasattr(self, 'worker') and hasattr(self, 'scan_thread') and self.scan_thread.isRunning():
+            self.append_log("Cancelando escaneo...")
+            self.worker.stop()
+            # Intentar terminar el hilo después de cancelar
+            # El worker saldrá de sus bucles rápidamente por timeouts cortos
+            QTimer.singleShot(500, self._force_quit_thread_if_needed)
+        else:
+            self.append_log("No hay escaneo en curso para cancelar.")
+
+    # Llamar setup cancel después de UI init
+
+    def _force_quit_thread_if_needed(self):
+        if hasattr(self, 'scan_thread') and self.scan_thread.isRunning() and getattr(self.worker, '_stop', False):
+            # Forzar finalización si aún sigue vivo
+            try:
+                self.scan_thread.requestInterruption()
+            except Exception:
+                pass
+            # Si sigue, llamar quit (solo terminará cuando run retorne)
+            self.scan_thread.quit()
+            self.append_log("Forzado cierre de hilo tras cancelación.")
