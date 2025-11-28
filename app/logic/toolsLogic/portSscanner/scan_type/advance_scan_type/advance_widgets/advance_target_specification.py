@@ -104,16 +104,20 @@ def scan_common_ports(ip, exclude_list=None):
             service = get_service_name(port_num, proto.lower())
             port_states.append((port, proto, service, state))
     open_ports = [(port, proto, service) for port, proto, service, state in port_states if state == 'open']
-    if open_ports:
-        now = datetime.now().astimezone()
-        fecha_hora = now.strftime("%Y-%m-%d %H:%M:%S %Z%z")
-        logging.info(f"\n========== Escaneando IP: {ip} ({host_name}) ==========")
-        logging.info(f"Escaneo realizado el: {fecha_hora}")
-        logging.info(f"Escaneando {ip} ({host_name}) en busca de puertos comunes abiertos...")
-        for port, proto, service in open_ports:
-            logging.info(f"Puerto {port}/{proto} ({service}): open")
-        elapsed = time.time() - start_time
-        logging.info(f"Escaneo finalizado en {elapsed:.2f} segundos.")
+    now = datetime.now().astimezone()
+    fecha_hora = now.strftime("%Y-%m-%d %H:%M:%S %Z%z")
+    logging.info(f"\n========== Escaneando IP: {ip} ({host_name}) ==========")
+    logging.info(f"Escaneo realizado el: {fecha_hora}")
+    # Mostrar si existe DNS inverso (PTR)
+    if host_name and host_name != 'No PTR':
+        logging.info(f"Reverse DNS: {host_name}")
+    else:
+        logging.info("Reverse DNS: No PTR (sin registro)")
+    logging.info(f"Escaneando {ip} ({host_name}) en busca de puertos comunes abiertos...")
+    for port, proto, service in open_ports:
+        logging.info(f"Puerto {port}/{proto} ({service}): open")
+    elapsed = time.time() - start_time
+    logging.info(f"Escaneo finalizado en {elapsed:.2f} segundos.")
     return port_states
 
 async def async_scan_tcp_port(ip, port, timeout=10):
@@ -137,6 +141,10 @@ async def async_scan_common_ports(ip):
     """
     try:
         resolved_ip = socket.gethostbyname(ip)
+        try:
+            host_name = socket.gethostbyaddr(resolved_ip)[0]
+        except Exception:
+            host_name = 'No PTR'
     except Exception:
         logging.error(f'Failed to resolve "{ip}".')
         logging.warning('WARNING: No targets were specified, so 0 hosts scanned.')
@@ -151,16 +159,19 @@ async def async_scan_common_ports(ip):
         service = get_service_name(port_num, proto.lower())
         port_states.append((port, proto, service, state))
     open_ports = [(port, proto, service) for port, proto, service, state in port_states if state == 'open']
-    if open_ports:
-        now = datetime.now().astimezone()
-        fecha_hora = now.strftime("%Y-%m-%d %H:%M:%S %Z%z")
-        logging.info(f"\n========== Escaneando IP: {ip} ==========")
-        logging.info(f"Escaneo realizado el: {fecha_hora}")
-        logging.info(f"Escaneando {ip} en busca de puertos comunes abiertos...")
-        for port, proto, service in open_ports:
-            logging.info(f"Puerto {port}/{proto} ({service}): open")
-        elapsed = time.time() - start_time
-        logging.info(f"Escaneo finalizado en {elapsed:.2f} segundos.")
+    now = datetime.now().astimezone()
+    fecha_hora = now.strftime("%Y-%m-%d %H:%M:%S %Z%z")
+    logging.info(f"\n========== Escaneando IP: {ip} ({host_name}) ==========")
+    logging.info(f"Escaneo realizado el: {fecha_hora}")
+    if host_name and host_name != 'No PTR':
+        logging.info(f"Reverse DNS: {host_name}")
+    else:
+        logging.info("Reverse DNS: No PTR (sin registro)")
+    logging.info(f"Escaneando {ip} ({host_name}) en busca de puertos comunes abiertos...")
+    for port, proto, service in open_ports:
+        logging.info(f"Puerto {port}/{proto} ({service}): open")
+    elapsed = time.time() - start_time
+    logging.info(f"Escaneo finalizado en {elapsed:.2f} segundos.")
     return port_states
 
 def scan_multiple_ips(ip_list, exclude_list=None):

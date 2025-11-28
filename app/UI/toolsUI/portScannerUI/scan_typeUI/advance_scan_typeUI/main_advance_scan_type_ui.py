@@ -290,9 +290,16 @@ class ScanWorker(QObject):
             return []
         try:
             resolved_ip = socket.gethostbyname(ip)
+            try:
+                host_name = socket.gethostbyaddr(resolved_ip)[0]
+            except Exception:
+                host_name = 'No PTR'
         except Exception:
             self.progress.emit(f"No se pudo resolver {ip}")
             return []
+        # Anunciar inicio con estado DNS junto a la IP
+        dns_label = host_name if host_name != 'No PTR' else 'No PTR'
+        self.progress.emit(f"Escaneando IP única: {ip} ({dns_label})")
         port_states = []
         start_time = time.time()
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -315,23 +322,29 @@ class ScanWorker(QObject):
                 service = adv_scan_logic.get_service_name(port_num, proto.lower())
                 port_states.append((port, proto, service, state))
                 if state == 'open':
-                    self.progress.emit(f"{ip} {port}/{proto} ({service}): open")
+                    self.progress.emit(f"{ip} ({dns_label}) {port}/{proto} ({service}): open")
         elapsed = time.time() - start_time
         if self._stop:
-            self.progress.emit(f"Cancelado {ip} en {elapsed:.2f}s")
+            self.progress.emit(f"Cancelado {ip} ({dns_label}) en {elapsed:.2f}s")
         else:
-            self.progress.emit(f"Completado {ip} en {elapsed:.2f}s")
+            self.progress.emit(f"Completado {ip} ({dns_label}) en {elapsed:.2f}s")
         return port_states
 
     def _scan_domain_interruptible(self, domain, exclude_list=None):
         try:
             ip = socket.gethostbyname(domain)
+            try:
+                host_name = socket.gethostbyaddr(ip)[0]
+            except Exception:
+                host_name = 'No PTR'
         except Exception:
             self.progress.emit(f"No se pudo resolver dominio {domain}")
             return []
         if exclude_list and (domain in exclude_list or ip in exclude_list):
             self.progress.emit(f"Dominio {domain} excluido")
             return []
+        dns_label = host_name if host_name != 'No PTR' else 'No PTR'
+        self.progress.emit(f"Escaneando dominio: {domain} ({ip}) ({dns_label})")
         start_time = time.time()
         port_states = []
         for port, proto in adv_scan_logic.COMMON_PORTS:
@@ -342,12 +355,12 @@ class ScanWorker(QObject):
             service = adv_scan_logic.get_service_name(port, proto.lower())
             port_states.append((port, proto, service, state))
             if state == 'open':
-                self.progress.emit(f"{domain} {port}/{proto} ({service}): open")
+                self.progress.emit(f"{domain} ({ip}) ({dns_label}) {port}/{proto} ({service}): open")
         elapsed = time.time() - start_time
         if self._stop:
-            self.progress.emit(f"Dominio {domain} cancelado en {elapsed:.2f}s")
+            self.progress.emit(f"Dominio {domain} ({ip}) ({dns_label}) cancelado en {elapsed:.2f}s")
         else:
-            self.progress.emit(f"Dominio {domain} completado en {elapsed:.2f}s")
+            self.progress.emit(f"Dominio {domain} ({ip}) ({dns_label}) completado en {elapsed:.2f}s")
         return port_states
 
     def _scan_single_tcp_port(self, ip, port, timeout=0.3):
