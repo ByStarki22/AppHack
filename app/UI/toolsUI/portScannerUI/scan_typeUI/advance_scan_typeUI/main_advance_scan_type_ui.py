@@ -79,7 +79,6 @@ class ScanWorker(QObject):
             if not ip:
                 self.progress.emit("Debes ingresar una IP válida.")
                 return {}
-            self.progress.emit(f"Escaneando IP única: {ip}")
             return {ip: self._scan_common_ports_interruptible(ip, exclude_list=exclude_list)}
 
         if p['multiple_ips']:
@@ -91,7 +90,6 @@ class ScanWorker(QObject):
                 if self._stop:
                     break
                 self._pause_check()
-                self.progress.emit(f"→ IP {ip}")
                 results[ip] = self._scan_common_ports_interruptible(ip, exclude_list=exclude_list)
             return results
 
@@ -126,7 +124,6 @@ class ScanWorker(QObject):
                 if self._stop:
                     break
                 self._pause_check()
-                self.progress.emit(f"→ IP {ip}")
                 results[ip] = self._scan_common_ports_interruptible(ip, exclude_list=exclude_list)
             return results
 
@@ -155,7 +152,6 @@ class ScanWorker(QObject):
                     if self._stop:
                         break
                     self._pause_check()
-                    self.progress.emit(f"→ IP {ip}")
                     results[ip] = self._scan_common_ports_interruptible(ip, exclude_list=exclude_list)
             except Exception as e:
                 self.progress.emit(f"Error CIDR: {e}")
@@ -288,18 +284,23 @@ class ScanWorker(QObject):
         if exclude_list and ip in exclude_list:
             self.progress.emit(f"IP {ip} excluida.")
             return []
+        # Respect no_reverse_dns flag from params
+        no_reverse = False
         try:
-            resolved_ip = socket.gethostbyname(ip)
-            try:
-                host_name = socket.gethostbyaddr(resolved_ip)[0]
-            except Exception:
-                host_name = 'No PTR'
+            no_reverse = bool(self.params.get('no_reverse_dns', False))
         except Exception:
+            no_reverse = False
+        resolved_ip, host_name = adv_scan_logic.get_host_info(ip, no_reverse_dns=no_reverse)
+        if resolved_ip is None:
             self.progress.emit(f"No se pudo resolver {ip}")
             return []
         # Anunciar inicio con estado DNS junto a la IP
         dns_label = host_name if host_name != 'No PTR' else 'No PTR'
-        self.progress.emit(f"Escaneando IP única: {ip} ({dns_label})")
+        # Si dns_label está vacío (reverse DNS omitido), no añadimos paréntesis
+        if dns_label:
+            self.progress.emit(f"Escaneando IP única: {ip} ({dns_label})")
+        else:
+            self.progress.emit(f"Escaneando IP única: {ip}")
         port_states = []
         start_time = time.time()
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -331,20 +332,25 @@ class ScanWorker(QObject):
         return port_states
 
     def _scan_domain_interruptible(self, domain, exclude_list=None):
+        # Respect no_reverse_dns flag from params
+        no_reverse = False
         try:
-            ip = socket.gethostbyname(domain)
-            try:
-                host_name = socket.gethostbyaddr(ip)[0]
-            except Exception:
-                host_name = 'No PTR'
+            no_reverse = bool(self.params.get('no_reverse_dns', False))
         except Exception:
+            no_reverse = False
+        resolved_ip, host_name = adv_scan_logic.get_host_info(domain, no_reverse_dns=no_reverse)
+        if resolved_ip is None:
             self.progress.emit(f"No se pudo resolver dominio {domain}")
             return []
+        ip = resolved_ip
         if exclude_list and (domain in exclude_list or ip in exclude_list):
             self.progress.emit(f"Dominio {domain} excluido")
             return []
         dns_label = host_name if host_name != 'No PTR' else 'No PTR'
-        self.progress.emit(f"Escaneando dominio: {domain} ({ip}) ({dns_label})")
+        if dns_label:
+            self.progress.emit(f"Escaneando dominio: {domain} ({ip}) ({dns_label})")
+        else:
+            self.progress.emit(f"Escaneando dominio: {domain} ({ip})")
         start_time = time.time()
         port_states = []
         for port, proto in adv_scan_logic.COMMON_PORTS:
@@ -803,6 +809,7 @@ class AdvanceScanTypeUI(QWidget):
             'exclude_value': t.input_exclude.text().strip(),
             'excludefile': t.checkbox_excludefile.isChecked(),
             'excludefile_value': t.input_excludefile.text().strip(),
+            'no_reverse_dns': t.checkbox_no_reverse_dns.isChecked(),
         }
 
     def _handle_worker_error(self, msg):
