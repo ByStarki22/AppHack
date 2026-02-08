@@ -51,7 +51,6 @@ class ScanTypeWidget(QWidget):
                 font-family: 'Segoe UI', Arial, sans-serif;
                 min-width: 110px;   /* Aumenta el min-width para que soporte la negrita */
                 max-width: 110px;   /* Fija el max-width igual al min-width */
-                box-sizing: border-box;
             }
             QPushButton:hover {
                 background-color: #3c3c3c;

@@ -523,6 +523,48 @@ class TargetSelectorUI(QGroupBox):
                     pass  # Puedes emitir un mensaje si quieres
         return exclude_list
 
+    def get_dns_options(self):
+        """
+        Obtiene las opciones de DNS configuradas por el usuario.
+        Returns:
+            dict con las siguientes claves:
+            - no_reverse_dns: bool - No realizar reverse DNS (-n)
+            - reverse_dns_all: bool - Realizar reverse DNS para todos (-R)
+            - resolve_all: bool - Escanear todas las direcciones (--resolve-all)
+            - unique: bool - Escanear cada IP una vez (--unique)
+            - use_system_dns: bool - Usar resolver DNS del sistema (--system-dns)
+            - dns_servers: str - Servidores DNS personalizados (--dns-servers)
+        """
+        return {
+            'no_reverse_dns': self.checkbox_no_reverse_dns.isChecked(),
+            'reverse_dns_all': self.checkbox_reverse_dns_all.isChecked(),
+            'resolve_all': self.checkbox_resolve_all.isChecked(),
+            'unique': self.checkbox_unique.isChecked(),
+            'use_system_dns': self.checkbox_system_dns.isChecked(),
+            'dns_servers': self.input_dns_servers.text().strip() if self.checkbox_dns_servers.isChecked() else ''
+        }
+
+    def configure_dns_settings(self):
+        """
+        Configura los ajustes de DNS en el backend antes de escanear.
+        """
+        from app.logic.toolsLogic.portSscanner.scan_type.advance_scan_type.advance_widgets.advance_target_specification import (
+            set_dns_servers, set_use_system_dns
+        )
+        
+        dns_opts = self.get_dns_options()
+        
+        # Configurar servidores DNS personalizados
+        if dns_opts['dns_servers']:
+            set_dns_servers(dns_opts['dns_servers'])
+            set_use_system_dns(False)
+        elif dns_opts['use_system_dns']:
+            set_dns_servers('')
+            set_use_system_dns(True)
+        else:
+            set_dns_servers('')
+            set_use_system_dns(True)
+
     def on_scan_button_clicked(self):
         # Check if at least one target selection option is enabled
         if not any([
@@ -537,19 +579,25 @@ class TargetSelectorUI(QGroupBox):
             self.message_signal.emit("Debes seleccionar al menos una opción de objetivo.")
             return
 
+        # Configurar opciones DNS antes de escanear
+        self.configure_dns_settings()
+        dns_opts = self.get_dns_options()
+        exclude_list = self.get_exclude_list()
+
         # Escanear una IP específica
         if self.checkbox_single_ip.isChecked():
             ip = self.input_single_ip.text().strip()
-            exclude_list = self.get_exclude_list()
             if ip:
                 from app.logic.toolsLogic.portSscanner.scan_type.advance_scan_type.advance_widgets.advance_target_specification import scan_common_ports
-                open_ports = scan_common_ports(ip, exclude_list=exclude_list, no_reverse_dns=self.checkbox_no_reverse_dns.isChecked())
-                # self.message_signal.emit(f"Resultado para {ip}: {open_ports}")  # Eliminado
+                open_ports = scan_common_ports(
+                    ip, 
+                    exclude_list=exclude_list, 
+                    no_reverse_dns=dns_opts['no_reverse_dns'],
+                    reverse_dns_all=dns_opts['reverse_dns_all']
+                )
             else:
                 self.message_signal.emit("Debes ingresar una IP válida.")
             return
-
-        exclude_list = self.get_exclude_list()
 
         # Escanear IPs específicas (varias separadas por coma o espacio)
         if self.checkbox_multiple_ips.isChecked():
@@ -557,9 +605,13 @@ class TargetSelectorUI(QGroupBox):
             if ips:
                 ip_list = [ip.strip() for ip in ips.replace(',', ' ').split() if ip.strip()]
                 from app.logic.toolsLogic.portSscanner.scan_type.advance_scan_type.advance_widgets.advance_target_specification import scan_multiple_ips
-                results = scan_multiple_ips(ip_list, exclude_list=exclude_list, no_reverse_dns=self.checkbox_no_reverse_dns.isChecked())
-                # for ip, ports in results.items():
-                #     self.message_signal.emit(f"Resultado para {ip}: {ports}")  # Eliminado
+                results = scan_multiple_ips(
+                    ip_list, 
+                    exclude_list=exclude_list, 
+                    no_reverse_dns=dns_opts['no_reverse_dns'],
+                    reverse_dns_all=dns_opts['reverse_dns_all'],
+                    unique=dns_opts['unique']
+                )
             else:
                 self.message_signal.emit("Debes ingresar al menos una IP.")
             return
@@ -570,11 +622,15 @@ class TargetSelectorUI(QGroupBox):
             if ranges:
                 try:
                     from app.logic.toolsLogic.portSscanner.scan_type.advance_scan_type.advance_widgets.advance_target_specification import scan_multiple_ip_ranges
-                    results = scan_multiple_ip_ranges(ranges, exclude_list=exclude_list, no_reverse_dns=self.checkbox_no_reverse_dns.isChecked())
+                    results = scan_multiple_ip_ranges(
+                        ranges, 
+                        exclude_list=exclude_list, 
+                        no_reverse_dns=dns_opts['no_reverse_dns'],
+                        reverse_dns_all=dns_opts['reverse_dns_all'],
+                        unique=dns_opts['unique']
+                    )
                     if not results:
                         self.message_signal.emit(f"No se encontraron hosts con puertos abiertos en los rangos especificados.")
-                    # for ip, ports in results.items():
-                    #     self.message_signal.emit(f"Resultado para {ip}: {ports}")  # Eliminado
                 except Exception as e:
                     self.message_signal.emit(f"Error: {str(e)}")
             else:
@@ -587,11 +643,15 @@ class TargetSelectorUI(QGroupBox):
             if cidr:
                 try:
                     from app.logic.toolsLogic.portSscanner.scan_type.advance_scan_type.advance_widgets.advance_target_specification import scan_cidr
-                    results = scan_cidr(cidr, exclude_list=exclude_list, no_reverse_dns=self.checkbox_no_reverse_dns.isChecked())
+                    results = scan_cidr(
+                        cidr, 
+                        exclude_list=exclude_list, 
+                        no_reverse_dns=dns_opts['no_reverse_dns'],
+                        reverse_dns_all=dns_opts['reverse_dns_all'],
+                        unique=dns_opts['unique']
+                    )
                     if not results:
                         self.message_signal.emit(f"No se encontraron hosts con puertos abiertos en el rango CIDR.")
-                    # for ip, ports in results.items():
-                    #     self.message_signal.emit(f"Resultado para {ip}: {ports}")  # Eliminado
                 except Exception as e:
                     self.message_signal.emit(f"Error: {str(e)}")
             else:
@@ -601,15 +661,18 @@ class TargetSelectorUI(QGroupBox):
         # Escanear un dominio
         if self.checkbox_domain.isChecked():
             domain = self.input_domain.text().strip()
-            exclude_list = self.get_exclude_list()
             if domain:
                 try:
                     from app.logic.toolsLogic.portSscanner.scan_type.advance_scan_type.advance_widgets.advance_target_specification import scan_domain
                     async def run_scan():
-                        open_ports = await scan_domain(domain, exclude_list=exclude_list, no_reverse_dns=self.checkbox_no_reverse_dns.isChecked())
-                        if open_ports:
-                            pass
-                        else:
+                        open_ports = await scan_domain(
+                            domain, 
+                            exclude_list=exclude_list, 
+                            no_reverse_dns=dns_opts['no_reverse_dns'],
+                            reverse_dns_all=dns_opts['reverse_dns_all'],
+                            resolve_all=dns_opts['resolve_all']
+                        )
+                        if not open_ports:
                             self.message_signal.emit(f"No se encontraron puertos abiertos para el dominio {domain}.")
                     asyncio.run(run_scan())
                 except Exception as e:
@@ -624,12 +687,16 @@ class TargetSelectorUI(QGroupBox):
             if file_path:
                 try:
                     from app.logic.toolsLogic.portSscanner.scan_type.advance_scan_type.advance_widgets.advance_target_specification import scan_targets_from_file
-                    results = scan_targets_from_file(file_path, exclude_list=exclude_list, no_reverse_dns=self.checkbox_no_reverse_dns.isChecked())
+                    results = scan_targets_from_file(
+                        file_path, 
+                        exclude_list=exclude_list, 
+                        no_reverse_dns=dns_opts['no_reverse_dns'],
+                        reverse_dns_all=dns_opts['reverse_dns_all'],
+                        resolve_all=dns_opts['resolve_all'],
+                        unique=dns_opts['unique']
+                    )
                     if not results:
                         self.message_signal.emit("No se encontraron hosts o puertos abiertos en el archivo.")
-                    # Puedes emitir los resultados aquí si lo deseas
-                    # for target, ports in results.items():
-                    #     self.message_signal.emit(f"Resultado para {target}: {ports}")
                 except Exception as e:
                     self.message_signal.emit(f"Error al escanear desde archivo: {str(e)}")
             else:
@@ -646,12 +713,14 @@ class TargetSelectorUI(QGroupBox):
                         self.message_signal.emit("Debes ingresar un número mayor a 0.")
                         return
                     from app.logic.toolsLogic.portSscanner.scan_type.advance_scan_type.advance_widgets.advance_target_specification import scan_random_ips
-                    results = scan_random_ips(n, exclude_list=exclude_list, no_reverse_dns=self.checkbox_no_reverse_dns.isChecked())
+                    results = scan_random_ips(
+                        n, 
+                        exclude_list=exclude_list, 
+                        no_reverse_dns=dns_opts['no_reverse_dns'],
+                        reverse_dns_all=dns_opts['reverse_dns_all']
+                    )
                     if not results:
                         self.message_signal.emit(f"No se encontraron hosts con puertos abiertos en los {n} hosts aleatorios.")
-                    # Puedes emitir los resultados aquí si lo deseas
-                    # for ip, ports in results.items():
-                    #     self.message_signal.emit(f"Resultado para {ip}: {ports}")
                 except ValueError:
                     self.message_signal.emit("Debes ingresar un número válido.")
                 except Exception as e:

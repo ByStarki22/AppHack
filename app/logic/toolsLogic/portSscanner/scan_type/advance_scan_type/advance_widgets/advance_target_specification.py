@@ -7,6 +7,119 @@ import logging
 from scapy.all import IP, TCP, sr1, conf
 import asyncio
 import random
+import subprocess
+import platform
+
+# Variable global para servidores DNS personalizados
+_custom_dns_servers = []
+_use_system_dns = True  # Por defecto usa el resolver del sistema
+
+
+def set_dns_servers(dns_servers_str):
+    """
+    Configura los servidores DNS personalizados.
+    dns_servers_str: string con servidores separados por comas (ej: "8.8.8.8,1.1.1.1")
+    """
+    global _custom_dns_servers
+    if dns_servers_str:
+        _custom_dns_servers = [s.strip() for s in dns_servers_str.split(',') if s.strip()]
+    else:
+        _custom_dns_servers = []
+
+
+def set_use_system_dns(use_system):
+    """
+    Configura si se debe usar el resolver DNS del sistema.
+    """
+    global _use_system_dns
+    _use_system_dns = use_system
+
+
+def resolve_with_custom_dns(hostname, dns_server, timeout=2):
+    """
+    Resuelve un hostname usando un servidor DNS específico con nslookup.
+    Retorna una lista de IPs resueltas o lista vacía si falla.
+    """
+    try:
+        if platform.system() == 'Windows':
+            cmd = ['nslookup', hostname, dns_server]
+        else:
+            cmd = ['nslookup', hostname, dns_server]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        output = result.stdout
+        
+        # Parsear la salida de nslookup para extraer IPs
+        ips = []
+        lines = output.split('\n')
+        in_answer = False
+        for line in lines:
+            line = line.strip()
+            # Detectar inicio de la sección de respuesta
+            if 'Name:' in line or 'Nombre:' in line:
+                in_answer = True
+                continue
+            if in_answer and ('Address:' in line or 'Addresses:' in line or 'Direcci' in line):
+                # Extraer IP de la línea
+                parts = line.split(':')
+                if len(parts) >= 2:
+                    ip_part = parts[-1].strip()
+                    # Validar que sea una IP válida (IPv4)
+                    if all(c.isdigit() or c == '.' for c in ip_part) and ip_part.count('.') == 3:
+                        ips.append(ip_part)
+        return ips
+    except Exception:
+        return []
+
+
+def resolve_hostname_all_ips(hostname, use_custom_dns=False):
+    """
+    Resuelve un hostname a TODAS sus direcciones IP (--resolve-all).
+    Retorna una lista de IPs.
+    """
+    global _custom_dns_servers, _use_system_dns
+    
+    ips = []
+    
+    # Si hay servidores DNS personalizados configurados
+    if _custom_dns_servers and not _use_system_dns:
+        for dns_server in _custom_dns_servers:
+            resolved = resolve_with_custom_dns(hostname, dns_server)
+            ips.extend(resolved)
+        # Eliminar duplicados manteniendo orden
+        seen = set()
+        unique_ips = []
+        for ip in ips:
+            if ip not in seen:
+                seen.add(ip)
+                unique_ips.append(ip)
+        return unique_ips if unique_ips else []
+    
+    # Usar el resolver del sistema con getaddrinfo para obtener TODAS las IPs
+    try:
+        results = socket.getaddrinfo(hostname, None, socket.AF_INET)
+        ips = list(set(result[4][0] for result in results))
+        return ips
+    except Exception:
+        # Fallback a gethostbyname_ex que también puede retornar múltiples IPs
+        try:
+            _, _, ip_list = socket.gethostbyname_ex(hostname)
+            return ip_list
+        except Exception:
+            return []
+
+
+def remove_duplicate_ips(ip_list):
+    """
+    Elimina IPs duplicadas de una lista manteniendo el orden (--unique).
+    """
+    seen = set()
+    unique = []
+    for ip in ip_list:
+        if ip not in seen:
+            seen.add(ip)
+            unique.append(ip)
+    return unique
 
 # Importa los puertos desde los archivos de puertos comunes
 from app.logic.toolsLogic.portSscanner.scan_type.advance_scan_type.advance_widgets.ports.tcp_common_ports import TCP_COMMON_PORTS
@@ -74,15 +187,31 @@ def get_service_name(port, proto='tcp'):
         return 'unknown'
 
 
-def get_host_info(ip_or_host, no_reverse_dns=False):
+def get_host_info(ip_or_host, no_reverse_dns=False, reverse_dns_all=False):
     """
     Resolve an IP or hostname to an IP and optionally perform reverse DNS lookup.
-    If `no_reverse_dns` is True, the reverse DNS (PTR) lookup is skipped and
-    the returned host_name will be 'No PTR (skipped)'.
+    
+    Parameters:
+    - ip_or_host: IP address or hostname to resolve
+    - no_reverse_dns: If True, skip reverse DNS (PTR) lookup entirely (-n)
+    - reverse_dns_all: If True, attempt reverse DNS even for offline hosts (-R)
+    
     Returns (resolved_ip, host_name) or (None, None) on failure.
     """
+    global _custom_dns_servers, _use_system_dns
+    
+    # Resolver el hostname a IP
     try:
-        resolved_ip = socket.gethostbyname(ip_or_host)
+        if _custom_dns_servers and not _use_system_dns:
+            # Usar DNS personalizado
+            ips = resolve_with_custom_dns(ip_or_host, _custom_dns_servers[0])
+            if ips:
+                resolved_ip = ips[0]
+            else:
+                resolved_ip = socket.gethostbyname(ip_or_host)
+        else:
+            # Usar resolver del sistema
+            resolved_ip = socket.gethostbyname(ip_or_host)
     except Exception:
         return (None, None)
 
@@ -91,22 +220,33 @@ def get_host_info(ip_or_host, no_reverse_dns=False):
         # y una cadena vacía para que no se imprima nada en los logs.
         return (resolved_ip, '')
 
+    # Realizar reverse DNS
     try:
         host_name = socket.gethostbyaddr(resolved_ip)[0]
     except Exception:
-        host_name = 'No PTR'
+        if reverse_dns_all:
+            # Con -R intentamos un lookup más agresivo
+            host_name = 'No PTR (reverse DNS forzado)'
+        else:
+            host_name = 'No PTR'
     return (resolved_ip, host_name)
 
-def scan_common_ports(ip, exclude_list=None, no_reverse_dns=False):
+def scan_common_ports(ip, exclude_list=None, no_reverse_dns=False, reverse_dns_all=False):
     """
     Escanea los puertos comunes de una IP y devuelve una lista de tuplas (puerto, protocolo, servicio, estado).
     Solo loguea los resultados si hay puertos abiertos.
     Ahora incluye DNS inverso por defecto.
+    
+    Parameters:
+    - ip: IP o hostname a escanear
+    - exclude_list: Lista de IPs a excluir
+    - no_reverse_dns: No realizar reverse DNS (-n)
+    - reverse_dns_all: Realizar reverse DNS incluso para hosts offline (-R)
     """
     if exclude_list and ip in exclude_list:
         logging.info(f'IP {ip} excluida del escaneo.')
         return []
-    resolved_ip, host_name = get_host_info(ip, no_reverse_dns=no_reverse_dns)
+    resolved_ip, host_name = get_host_info(ip, no_reverse_dns=no_reverse_dns, reverse_dns_all=reverse_dns_all)
     if resolved_ip is None:
         logging.error(f'Failed to resolve "{ip}".')
         logging.warning('WARNING: No targets were specified, so 0 hosts scanned.')
@@ -159,12 +299,17 @@ async def async_scan_tcp_port(ip, port, timeout=10):
     except Exception:
         return (port, 'filtered')
 
-async def async_scan_common_ports(ip, no_reverse_dns=False):
+async def async_scan_common_ports(ip, no_reverse_dns=False, reverse_dns_all=False):
     """
     Escanea los puertos comunes de una IP de forma asíncrona.
+    
+    Parameters:
+    - ip: IP o hostname a escanear
+    - no_reverse_dns: No realizar reverse DNS (-n)
+    - reverse_dns_all: Realizar reverse DNS incluso para hosts offline (-R)
     """
     try:
-        resolved_ip, host_name = get_host_info(ip, no_reverse_dns=no_reverse_dns)
+        resolved_ip, host_name = get_host_info(ip, no_reverse_dns=no_reverse_dns, reverse_dns_all=reverse_dns_all)
         if resolved_ip is None:
             logging.error(f'Failed to resolve "{ip}".')
             logging.warning('WARNING: No targets were specified, so 0 hosts scanned.')
@@ -203,12 +348,27 @@ async def async_scan_common_ports(ip, no_reverse_dns=False):
     logging.info(f"Escaneo finalizado en {elapsed:.2f} segundos.")
     return port_states
 
-def scan_multiple_ips(ip_list, exclude_list=None, no_reverse_dns=False):
+def scan_multiple_ips(ip_list, exclude_list=None, no_reverse_dns=False, reverse_dns_all=False, unique=False):
+    """
+    Escanea múltiples IPs.
+    
+    Parameters:
+    - ip_list: Lista de IPs a escanear
+    - exclude_list: Lista de IPs a excluir
+    - no_reverse_dns: No realizar reverse DNS (-n)
+    - reverse_dns_all: Realizar reverse DNS incluso para hosts offline (-R)
+    - unique: Eliminar IPs duplicadas (--unique)
+    """
     if exclude_list:
         ip_list = exclude_ips(ip_list, exclude_list)
+    
+    # Aplicar --unique si está habilitado
+    if unique:
+        ip_list = remove_duplicate_ips(ip_list)
+    
     results = {}
     for ip in ip_list:
-        port_states = scan_common_ports(ip, exclude_list=exclude_list, no_reverse_dns=no_reverse_dns)
+        port_states = scan_common_ports(ip, exclude_list=exclude_list, no_reverse_dns=no_reverse_dns, reverse_dns_all=reverse_dns_all)
         results[ip] = port_states
     logging.info("Análisis de múltiples IPs finalizado.")
     return results
@@ -227,7 +387,17 @@ def scan_ip_range(start_ip, end_ip, exclude_list=None):
         ip_list = exclude_ips(ip_list, exclude_list)
     return scan_multiple_ips(ip_list)
 
-def scan_multiple_ip_ranges(ranges_str, exclude_list=None, no_reverse_dns=False):
+def scan_multiple_ip_ranges(ranges_str, exclude_list=None, no_reverse_dns=False, reverse_dns_all=False, unique=False):
+    """
+    Escanea múltiples rangos de IPs.
+    
+    Parameters:
+    - ranges_str: String con rangos de IPs (ej: "192.168.1.100-120,192.168.1.200-210")
+    - exclude_list: Lista de IPs a excluir
+    - no_reverse_dns: No realizar reverse DNS (-n)
+    - reverse_dns_all: Realizar reverse DNS incluso para hosts offline (-R)
+    - unique: Eliminar IPs duplicadas (--unique)
+    """
     results = {}
     ranges = [r.strip() for r in ranges_str.split(',') if r.strip()]
     ip_list = []
@@ -252,6 +422,10 @@ def scan_multiple_ip_ranges(ranges_str, exclude_list=None, no_reverse_dns=False)
 
     if exclude_list:
         ip_list = exclude_ips(ip_list, exclude_list)
+    
+    # Aplicar --unique si está habilitado
+    if unique:
+        ip_list = remove_duplicate_ips(ip_list)
 
     if not ip_list:
         return results
@@ -259,7 +433,7 @@ def scan_multiple_ip_ranges(ranges_str, exclude_list=None, no_reverse_dns=False)
     # Paraleliza el escaneo por IP (cada IP ejecuta scan_common_ports)
     max_workers = min(200, max(10, len(ip_list)))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(scan_common_ports, ip, exclude_list, no_reverse_dns): ip for ip in ip_list}
+        futures = {executor.submit(scan_common_ports, ip, exclude_list, no_reverse_dns, reverse_dns_all): ip for ip in ip_list}
         for future in as_completed(futures):
             ip = futures[future]
             try:
@@ -270,7 +444,17 @@ def scan_multiple_ip_ranges(ranges_str, exclude_list=None, no_reverse_dns=False)
     logging.info("Análisis de múltiples rangos IP finalizado.")
     return results
 
-def scan_cidr(cidr_str, exclude_list=None, no_reverse_dns=False):
+def scan_cidr(cidr_str, exclude_list=None, no_reverse_dns=False, reverse_dns_all=False, unique=False):
+    """
+    Escanea un rango CIDR.
+    
+    Parameters:
+    - cidr_str: Notación CIDR (ej: "192.168.1.0/24")
+    - exclude_list: Lista de IPs a excluir
+    - no_reverse_dns: No realizar reverse DNS (-n)
+    - reverse_dns_all: Realizar reverse DNS incluso para hosts offline (-R)
+    - unique: Eliminar IPs duplicadas (--unique)
+    """
     results = {}
     try:
         ip_part, prefix = cidr_str.split('/')
@@ -287,7 +471,7 @@ def scan_cidr(cidr_str, exclude_list=None, no_reverse_dns=False):
         ip_list = [int_to_ip(ip_int) for ip_int in range(start_ip_int, end_ip_int + 1)]
         if exclude_list:
             ip_list = exclude_ips(ip_list, exclude_list)
-        res = scan_multiple_ips(ip_list, exclude_list=exclude_list, no_reverse_dns=no_reverse_dns)
+        res = scan_multiple_ips(ip_list, exclude_list=exclude_list, no_reverse_dns=no_reverse_dns, reverse_dns_all=reverse_dns_all, unique=unique)
         logging.info(f"Análisis de CIDR {cidr_str} finalizado.")
         return res
     except Exception as e:
@@ -295,13 +479,62 @@ def scan_cidr(cidr_str, exclude_list=None, no_reverse_dns=False):
         logging.info(f"Análisis de CIDR {cidr_str} finalizado.")
         return results
 
-async def scan_domain(domain, exclude_list=None, no_reverse_dns=False):
+async def scan_domain(domain, exclude_list=None, no_reverse_dns=False, reverse_dns_all=False, resolve_all=False):
     """
     Escanea los puertos comunes de un dominio (ej: 'google.com') en paralelo usando escaneo TCP asíncrono.
     Devuelve la lista de puertos y sus estados (open, closed, open|filtered).
     Si el dominio o su IP está en exclude_list, no se escanea.
+    
+    Parameters:
+    - domain: Dominio a escanear
+    - exclude_list: Lista de IPs/dominios a excluir
+    - no_reverse_dns: No realizar reverse DNS (-n)
+    - reverse_dns_all: Realizar reverse DNS incluso para hosts offline (-R)
+    - resolve_all: Escanear TODAS las IPs a las que resuelve el dominio (--resolve-all)
     """
-    resolved_ip, host_name = get_host_info(domain, no_reverse_dns=no_reverse_dns)
+    all_results = []
+    
+    # Si resolve_all está habilitado, obtener todas las IPs del dominio
+    if resolve_all:
+        all_ips = resolve_hostname_all_ips(domain)
+        if not all_ips:
+            logging.error(f"No se pudo resolver el dominio '{domain}'.")
+            logging.info(f"Análisis de dominio {domain} finalizado.")
+            return []
+        
+        logging.info(f"Dominio '{domain}' resuelto a {len(all_ips)} direcciones IP: {', '.join(all_ips)}")
+        
+        for ip in all_ips:
+            if exclude_list and (domain in exclude_list or ip in exclude_list):
+                logging.info(f"IP {ip} del dominio '{domain}' excluida del escaneo.")
+                continue
+            
+            now = datetime.now().astimezone()
+            fecha_hora = now.strftime("%Y-%m-%d %H:%M:%S %Z%z")
+            logging.info(f"\n========== Escaneando dominio: {domain} ({ip}) ==========")
+            logging.info(f"Escaneo realizado el: {fecha_hora}")
+            
+            start_time = time.time()
+            tasks = [async_scan_tcp_port(ip, port) for port, _ in COMMON_PORTS]
+            try:
+                results = await asyncio.gather(*tasks)
+                port_states = []
+                for (port, proto), (port_num, state) in zip(COMMON_PORTS, results):
+                    service = get_service_name(port_num, proto.lower())
+                    port_states.append((port, proto, service, state))
+                    if state in ('open', 'closed'):
+                        logging.info(f"Puerto {port}/{proto} ({service}): {state}")
+                all_results.extend(port_states)
+                elapsed = time.time() - start_time
+                logging.info(f"Escaneo de {ip} finalizado en {elapsed:.2f} segundos.")
+            except Exception as e:
+                logging.error(f"Error escaneando IP {ip}: {e}")
+        
+        logging.info(f"Análisis de dominio {domain} finalizado.")
+        return all_results
+    
+    # Comportamiento normal (una sola IP)
+    resolved_ip, host_name = get_host_info(domain, no_reverse_dns=no_reverse_dns, reverse_dns_all=reverse_dns_all)
     if resolved_ip is None:
         logging.error(f"No se pudo resolver el dominio '{domain}'.")
         logging.info(f"Análisis de dominio {domain} finalizado.")
@@ -337,11 +570,19 @@ async def scan_domain(domain, exclude_list=None, no_reverse_dns=False):
         logging.info(f"Análisis de dominio {domain} finalizado.")
         return []
 
-def scan_targets_from_file(file_path, exclude_list=None, no_reverse_dns=False):
+def scan_targets_from_file(file_path, exclude_list=None, no_reverse_dns=False, reverse_dns_all=False, resolve_all=False, unique=False):
     """
     Lee un archivo con una lista de objetivos (IP, rango, CIDR, dominio) y los escanea uno por uno.
     El escaneo de dominios se realiza exactamente igual que scan_domain (con logging detallado).
     Al finalizar, avisa en el log que el escaneo de todos los objetivos ha terminado.
+    
+    Parameters:
+    - file_path: Ruta al archivo con objetivos
+    - exclude_list: Lista de IPs/dominios a excluir
+    - no_reverse_dns: No realizar reverse DNS (-n)
+    - reverse_dns_all: Realizar reverse DNS incluso para hosts offline (-R)
+    - resolve_all: Escanear TODAS las IPs de cada dominio (--resolve-all)
+    - unique: Eliminar IPs duplicadas (--unique)
     """
     results = {}
     try:
@@ -349,13 +590,13 @@ def scan_targets_from_file(file_path, exclude_list=None, no_reverse_dns=False):
             lines = [line.strip() for line in f if line.strip()]
         for target in lines:
             if '/' in target:  # CIDR
-                results[target] = scan_cidr(target, exclude_list, no_reverse_dns=no_reverse_dns)
+                results[target] = scan_cidr(target, exclude_list, no_reverse_dns=no_reverse_dns, reverse_dns_all=reverse_dns_all, unique=unique)
             elif '-' in target:  # Rango de IPs
-                results[target] = scan_multiple_ip_ranges(target, exclude_list, no_reverse_dns=no_reverse_dns)
+                results[target] = scan_multiple_ip_ranges(target, exclude_list, no_reverse_dns=no_reverse_dns, reverse_dns_all=reverse_dns_all, unique=unique)
             elif all(c.isdigit() or c == '.' for c in target):  # IP individual
                 if exclude_list and target in exclude_list:
                     continue
-                results[target] = scan_common_ports(target, exclude_list=exclude_list, no_reverse_dns=no_reverse_dns)
+                results[target] = scan_common_ports(target, exclude_list=exclude_list, no_reverse_dns=no_reverse_dns, reverse_dns_all=reverse_dns_all)
             else:
                 # Dominio: excluir por nombre o IP resuelta
                 try:
@@ -366,7 +607,7 @@ def scan_targets_from_file(file_path, exclude_list=None, no_reverse_dns=False):
                     logging.info(f"Dominio '{target}' ({ip}) excluido del escaneo.")
                     logging.info(f"Análisis de dominio {target} finalizado.")
                     continue
-                results[target] = asyncio.run(scan_domain(target, exclude_list=exclude_list, no_reverse_dns=no_reverse_dns))
+                results[target] = asyncio.run(scan_domain(target, exclude_list=exclude_list, no_reverse_dns=no_reverse_dns, reverse_dns_all=reverse_dns_all, resolve_all=resolve_all))
         logging.info("Escaneo de todos los objetivos del archivo finalizado.")
     except Exception as e:
         logging.error(f"Error al procesar el archivo de objetivos: {e}")
@@ -391,7 +632,16 @@ def generate_random_ip():
             continue
         return ip
 
-def scan_random_ips(n=10, exclude_list=None, no_reverse_dns=False):
+def scan_random_ips(n=10, exclude_list=None, no_reverse_dns=False, reverse_dns_all=False):
+    """
+    Escanea n IPs aleatorias.
+    
+    Parameters:
+    - n: Número de IPs aleatorias a escanear
+    - exclude_list: Lista de IPs a excluir
+    - no_reverse_dns: No realizar reverse DNS (-n)
+    - reverse_dns_all: Realizar reverse DNS incluso para hosts offline (-R)
+    """
     results = {}
     scanned = set()
     start_time = time.time()
@@ -402,7 +652,7 @@ def scan_random_ips(n=10, exclude_list=None, no_reverse_dns=False):
             ip = generate_random_ip()
         scanned.add(ip)
         logging.info(f"Escaneando IP aleatoria: {ip}")
-        port_states = scan_common_ports(ip, no_reverse_dns=no_reverse_dns)
+        port_states = scan_common_ports(ip, no_reverse_dns=no_reverse_dns, reverse_dns_all=reverse_dns_all)
         abiertos = [p for p in port_states if p[3] == 'open']
         cerrados = [p for p in port_states if p[3] == 'closed']
         if abiertos or cerrados:
